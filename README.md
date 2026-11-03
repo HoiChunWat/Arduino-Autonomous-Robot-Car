@@ -1,224 +1,213 @@
-# Arduino Autonomous Robot Car 
+# Arduino Autonomous Robot Car
 
-A hardware-oriented Arduino robot-car firmware project featuring four digital infrared sensors, ultrasonic obstacle sensing, and independent left/right PWM motor control. This branch of the project is a **safety-oriented refactor of the author's Version 3 sketch**: it keeps the documented wiring, motion commands, PWM calibration, and obstacle maneuver timings, while changing the control architecture and error handling.
+An embedded robotics project combining **four digital IR sensors**, **ultrasonic obstacle detection**, and **independent PWM motor control**. The current firmware refactors an earlier Arduino sketch into a **mode-based controller with prioritized sensor decisions, timed motion sequences, and explicit fault handling**.
 
-> **Validation status:** Code-level refactor only. This version has **not been verified on the original physical robot**. The circuit, sensor polarities, motor directions, and updated behavior must be checked before a live demonstration. No performance claims or success rates are implied.
+> **Status:** Refactored firmware available; **physical robot validation pending**. The original Version 3 pin assignments, PWM settings, and programmed maneuver durations are preserved, but the new control behavior has not been verified on the original hardware.
 
 ## Contents
 
-- [Project scope](#project-scope)
+- [Project overview](#project-overview)
 - [System architecture](#system-architecture)
 - [Controller decision flow](#controller-decision-flow)
-- [Hardware and pin mapping](#hardware-and-pin-mapping)
 - [Sensor decision table](#sensor-decision-table)
-- [Obstacle-avoidance and search sequence](#obstacle-avoidance-and-search-sequence)
-- [Firmware design](#firmware-design)
-- [Changes from original Version 3](#changes-from-original-version-3)
+- [Obstacle avoidance and line recovery](#obstacle-avoidance-and-line-recovery)
+- [Hardware interfaces and PWM](#hardware-interfaces-and-pwm)
+- [Firmware design and engineering decisions](#firmware-design-and-engineering-decisions)
 - [Build and validation](#build-and-validation)
-- [Known limitations and engineering trade-offs](#known-limitations-and-engineering-trade-offs)
+- [Limitations and future work](#limitations-and-future-work)
 - [Repository structure](#repository-structure)
 
-## Project scope
+## Project overview
 
-This firmware combines line-responsive driving with a timed obstacle-avoidance sequence and a line reacquisition loop. It is a **rule-based mobile robot controller**, not autonomous mapping, SLAM, PID line control, or an RTOS-based system.
+The robot combines two behaviors:
 
-The original V3 sketch selected motion through multiple independent `if` statements and used blocking delays. This version replaces that behavior with a prioritized decision chain and an explicit controller mode.
+1. **Line-responsive driving:** four digital infrared inputs select forward, reverse, or corrective turning motions.
+2. **Obstacle handling:** an ultrasonic reading below **15 cm** starts a fixed left-turn / forward / right-turn sequence, followed by a timed search for the line.
+
+The controller uses **rule-based navigation and open-loop motor timings**. It does not implement SLAM, PID tracking, odometry, or an RTOS.
+
+| Feature | Current implementation |
+|---|---|
+| IR inputs | 2 inner + 2 outer digital sensors |
+| Distance measurement | Ultrasonic TRIG/ECHO, 30 ms echo timeout |
+| Motor drive | GPIO direction pins + independent left/right PWM |
+| Control structure | Five controller modes and prioritized IR decisions |
+| Motion timing | `millis()`-based steps; ultrasonic `pulseIn()` remains blocking |
+| Fault handling | Sonar no-echo stop/retry; 8-second line-search timeout |
+| Hardware validation | **Pending for refactored firmware** |
 
 ## System architecture
 
 ```mermaid
 flowchart LR
-    UL["Ultrasonic TRIG/ECHO"] --> MCU["Arduino Control Loop"]
-    IR["4 Digital IR Inputs"] --> MCU
-    MCU --> DEC["Mode / Decision Logic"]
-    DEC --> DIR["GPIO Direction Signals"]
-    DEC --> PWM["Independent PWM Outputs"]
-    DIR --> DRIVER["External Motor Driver (model unconfirmed)"]
+    US["Ultrasonic Sensor<br/>TRIG / ECHO"] --> MCU["Arduino MCU"]
+    IR["4 Digital IR Sensors"] --> MCU
+    MCU --> LOGIC["Controller Modes<br/>and Sensor Priorities"]
+    LOGIC --> GPIO["Direction GPIO"]
+    LOGIC --> PWM["Left / Right PWM"]
+    GPIO --> DRIVER["Motor Driver<br/>(model unconfirmed)"]
     PWM --> DRIVER
-    DRIVER --> L["Left DC Motor"]
-    DRIVER --> R["Right DC Motor"]
+    DRIVER --> LM["Left DC Motor"]
+    DRIVER --> RM["Right DC Motor"]
 ```
+
+The diagram represents the signal-level architecture inferred from the firmware. The exact Arduino board, motor-driver model, and sensor modules are not yet confirmed.
 
 ## Controller decision flow
 
+The firmware runs **one selected motion sequence at a time**. This is intentionally different from the original Version 3, whose independent `if` statements could initiate multiple actions in a single loop iteration.
+
 ```mermaid
 flowchart TD
-    A["Start / loop"] --> B{"Current mode?"}
-    B -->|Execute timed steps| C["Advance one timed step using millis"]
-    C --> D{"Plan complete?"}
+    A["Arduino loop"] --> B{"Controller mode"}
+    B -->|EXECUTE_STEPS| C["Advance timed motion step"]
+    C --> D{"Sequence finished?"}
     D -->|No| A
-    D -->|Yes, obstacle plan| S["Begin line search"]
-    D -->|Yes, IR plan| F["Return to follow mode"]
-    S --> A
+    D -->|Obstacle sequence| E["Enter line search"]
+    D -->|IR sequence| F["Return to FOLLOW_LINE"]
+    E --> A
     F --> A
-    B -->|Search for line| E{"Either inner IR = HIGH?"}
-    E -->|Yes| G["Stop and return to follow mode"]
-    E -->|No| H{"Elapsed >= 8 s?"}
-    H -->|Yes| I["Stop; latched search fault"]
-    H -->|No| J["Alternate forward 100 ms / stop 500 ms"]
-    G --> A
+
+    B -->|SEARCH_FOR_LINE| G{"Either inner IR HIGH?"}
+    G -->|Yes| H["Stop and return to FOLLOW_LINE"]
+    G -->|No| I{"Search >= 8 seconds?"}
+    I -->|Yes| J["Stop: latched search fault"]
+    I -->|No| K["Forward 100 ms / Stop 500 ms"]
+    H --> A
+    K --> A
     J --> A
-    B -->|Search timeout fault| I
-    B -->|Follow / sonar fault| K{"Sonar sample due?"}
-    K -->|Yes| L["Measure with 30 ms echo timeout"]
-    L --> M{"Valid echo?"}
-    M -->|No| N["Stop; retry sensor later"]
-    M -->|Yes| O{"Distance < 15 cm?"}
-    O -->|Yes| P["Start obstacle maneuver"]
-    O -->|No| Q["Evaluate IR inputs"]
-    K -->|No and mode is follow| Q
-    K -->|No and mode is sonar fault| N
-    Q --> R["Outer-right / outer-left priority;
-then inner sensor combination"]
-    R --> T["Start exactly one IR maneuver"]
-    T --> A
-    N --> A
-    P --> A
-    I --> A
+
+    B -->|SEARCH_TIMEOUT_FAULT| J
+    B -->|FOLLOW_LINE or SONAR_FAULT| L{"Sonar sample due?"}
+    L -->|Yes| M["Measure echo with 30 ms timeout"]
+    M --> N{"Valid echo?"}
+    N -->|No| O["Stop and retry later"]
+    N -->|Yes| P{"Distance < 15 cm?"}
+    P -->|Yes| Q["Start obstacle sequence"]
+    P -->|No| R["Select IR response"]
+    L -->|No, FOLLOW_LINE| R
+    L -->|No, SONAR_FAULT| O
+    R --> S["Start one timed IR sequence"]
+    S --> A
+    Q --> A
+    O --> A
 ```
 
-**Important distinction:** this is the **refactored control flow**. The original Version 3 could execute multiple IR `if` bodies during one iteration; this version intentionally chooses only one plan per evaluation.
-
-## Hardware and pin mapping
-
-| Interface | Arduino pin | Direction | Notes |
-|---|---|---|---|
-| Ultrasonic Trigger | D13 | Output | 10 microsecond trigger pulse |
-| Ultrasonic Echo | D4 | Input | `pulseIn` with timeout |
-| Left motor IN1 / IN2 | D8 / D9 | Output | Motor direction |
-| Left motor PWM | D10 | PWM output | Left speed |
-| Right motor IN1 / IN2 | D7 / D6 | Output | Motor direction |
-| Right motor PWM | D5 | PWM output | Right speed |
-| Inner right IR | D3 | Input | Digital sensor state |
-| Inner left IR | D12 | Input | Digital sensor state |
-| Outer right IR | D2 | Input | Boundary correction |
-| Outer left IR | D11 | Input | Boundary correction |
-
-The original board, motor driver, and sensor module models are not established by the sketch. The firmware assumes the V3 wiring and motor polarity. Original comments describe `HIGH = black`, `LOW = white`, but this must be verified on the actual sensor modules.
-
-### PWM values
-
-| Command | Left PWM | Right PWM | Direction behavior |
-|---|---:|---:|---|
-| Forward | 150 | 158 | Opposite left/right logic levels due to motor orientation |
-| Backward | 150 | 158 | Reversed directions |
-| Turn left | 0 | 125 | Right wheel drives |
-| Turn right | 130 | 0 | Left wheel drives |
-| Stop | 0 | 0 | Motor PWM disabled |
-
-These values are inherited from V3; they have not been newly calibrated or characterized.
+**Priority:** a detected obstacle takes precedence at ultrasonic sample time; otherwise outer IR corrections are checked before inner IR combinations. Sonar is not resampled during an active motion sequence or line search.
 
 ## Sensor decision table
 
-The following is the **priority order of the refactored firmware**, after a valid sonar reading and only in line-follow mode. `1` means a `HIGH` digital reading; `0` means `LOW`.
+This table reflects `chooseLineAction()` in the **refactored firmware**. `1` means digital `HIGH` and `0` means digital `LOW`; these are raw input values, **not confirmed black/white interpretations**.
 
-| Priority | Outer right (D2) | Outer left (D11) | Inner left (D12) | Inner right (D3) | Selected response |
+| Priority | Outer right D2 | Outer left D11 | Inner left D12 | Inner right D3 | Programmed action |
 |---:|:---:|:---:|:---:|:---:|---|
-| 1 | 1 | 0 | any | any | Backward 30 ms → right 300 ms → stop 10 ms |
-| 2 | 0 | 1 | any | any | Backward 30 ms → left 500 ms → stop 10 ms |
-| 3 | 0/1 | Same as right | 1 | 1 | Stop 100 ms → forward 100 ms |
-| 4 | 0/1 | Same as right | 0 | 1 | Left 30 ms → stop 10 ms |
-| 5 | 0/1 | Same as right | 1 | 0 | Right 30 ms → stop 10 ms |
-| 6 | 0/1 | Same as right | 0 | 0 | Stop 100 ms → backward 50 ms |
+| 1 | 1 | 0 | Any | Any | Reverse 30 ms → right 300 ms → stop 10 ms |
+| 2 | 0 | 1 | Any | Any | Reverse 30 ms → left 500 ms → stop 10 ms |
+| 3 | Equal outer readings | Equal | 1 | 1 | Stop 100 ms → forward 100 ms |
+| 4 | Equal outer readings | Equal | 0 | 1 | Left 30 ms → stop 10 ms |
+| 5 | Equal outer readings | Equal | 1 | 0 | Right 30 ms → stop 10 ms |
+| 6 | Equal outer readings | Equal | 0 | 0 | Stop 100 ms → reverse 50 ms |
 
-The `0/1` notation in priorities 3–6 means **outer sensors are equal** (`0/0` or `1/1`), so neither outer correction triggers.
+**Equal outer readings** means D2/D11 are both `0` or both `1`. IR electrical polarity and actual wheel response must be confirmed on the robot.
 
-## Obstacle-avoidance and search sequence
+## Obstacle avoidance and line recovery
 
-**Trigger:** valid ultrasonic distance below 15 cm.
+A **valid** ultrasonic measurement below **15 cm** triggers this sequence:
 
-| Step | Action | Duration | Source |
-|---:|---|---:|---|
-| 1 | Stop | 1000 ms | V3 |
-| 2 | Turn left | 700 ms | V3 |
-| 3 | Stop | 1000 ms | V3 |
-| 4 | Forward | 500 ms | V3 |
-| 5 | Stop | 1000 ms | V3 |
-| 6 | Turn right | 750 ms | V3 |
-| 7 | Stop | 1000 ms | V3 |
-| 8 | Forward 100 ms ↔ stop 500 ms | Repeat until either inner sensor reads HIGH | V3 pattern |
-| 9 | Search timeout: stop and latch fault | 8 seconds from start of search | **New safety policy** |
+| Step | Motion | Duration |
+|---:|---|---:|
+| 1 | Stop | 1,000 ms |
+| 2 | Turn left | 700 ms |
+| 3 | Stop | 1,000 ms |
+| 4 | Forward | 500 ms |
+| 5 | Stop | 1,000 ms |
+| 6 | Turn right | 750 ms |
+| 7 | Stop | 1,000 ms |
+| 8 | Search: forward / stop | 100 ms / 500 ms, repeated |
+| 9 | Exit search | Either inner IR reads `HIGH`, or stop at 8-second timeout |
 
-```mermaid
-flowchart TD
-    A["Valid distance < 15 cm"] --> B["Stop 1000 ms"]
-    B --> C["Left 700 ms"]
-    C --> D["Stop 1000 ms"]
-    D --> E["Forward 500 ms"]
-    E --> F["Stop 1000 ms"]
-    F --> G["Right 750 ms"]
-    G --> H["Stop 1000 ms"]
-    H --> I{"Either inner IR HIGH?"}
-    I -->|Yes| J["Stop → follow mode"]
-    I -->|No| K{"Search >= 8 seconds?"}
-    K -->|Yes| L["Stop → fault until reset"]
-    K -->|No| M["Forward 100 ms, stop 500 ms"]
-    M --> I
-```
+Steps 1–8 retain the original Version 3 motion pattern and timings. The **8-second timeout is new**, introduced to prevent indefinite search; it has **not** been experimentally tuned.
 
-The original source uses a `do ... while` with no maximum search duration. The finite timeout is deliberately introduced here and is not claimed as an original feature.
+The sequence is fixed-time and open-loop, so the actual travel path depends on wheel traction, surface conditions, battery voltage, and motor performance.
 
-## Firmware design
+## Hardware interfaces and PWM
 
-The main sketch is at [`firmware/robot_car_v3_refactored/robot_car_v3_refactored.ino`](firmware/robot_car_v3_refactored/robot_car_v3_refactored.ino).
+### Pin mapping
 
-- **Motor driver abstraction:** `drive(Motion)` centralizes GPIO direction signals and PWM settings.
-- **Timed sequence runner:** `startTimedSteps()` and `updateTimedSteps()` execute motor commands with `millis()` timestamps.
-- **Controller modes:** `FOLLOW_LINE`, `EXECUTE_STEPS`, `SEARCH_FOR_LINE`, `SONAR_FAULT`, `SEARCH_TIMEOUT_FAULT`.
-- **Range measurement:** `measureDistanceCm()` times the ultrasonic echo with a 30 ms timeout; a missing echo is invalid, not zero centimeters.
-- **Decision priority:** obstacle handling takes precedence when sonar sampling is due; otherwise outer IR corrections take precedence over inner IR combinations.
-
-## Changes from original Version 3
-
-| Issue in Version 3 | Refactored behavior | Intentional difference? |
+| Interface | Arduino pin | Direction |
 |---|---|---|
-| Multiple independent IR `if` statements | Prioritized `if / else if` decision chain | **Yes**; only one action plan at a time |
-| Multiple `delay()` calls | Timer-driven maneuver state using `millis()` | **Yes**; improved software responsiveness, but see limitations below |
-| `pulseIn()` without explicit timeout | `pulseIn(..., 30000UL)` | **Yes**; bounded echo wait |
-| Missing echo becomes zero-distance measurement | Enter stopped sonar-fault mode; auto-retry | **Yes**; fail-safe, but may stop in open space |
-| Unbounded obstacle-recovery `do ... while` | 8-second search timeout; latched fault until reset | **Yes**; prevents indefinite driving |
-| Unstructured motion logic | Named motion commands, timed sequences and controller modes | **Yes**; structure and control flow improved |
-| Motor PWM and directions | Same as original V3 | No |
-| Obstacle turn / drive / stop durations | Same as original V3 | No |
+| Ultrasonic TRIG / ECHO | D13 / D4 | Output / input |
+| Left motor direction | D8 / D9 | Output |
+| Left motor PWM | D10 | PWM output |
+| Right motor direction | D7 / D6 | Output |
+| Right motor PWM | D5 | PWM output |
+| Inner right / left IR | D3 / D12 | Input |
+| Outer right / left IR | D2 / D11 | Input |
+
+### Motor PWM values
+
+| Motion | Left PWM | Right PWM |
+|---|---:|---:|
+| Forward | 150 | 158 |
+| Backward | 150 | 158 |
+| Turn left | 0 | 125 |
+| Turn right | 130 | 0 |
+| Stop | 0 | 0 |
+
+PWM values and direction-pin logic were inherited from Version 3; **no new motor calibration results are claimed**.
+
+## Firmware design and engineering decisions
+
+The main sketch is [`firmware/robot_car_v3_refactored/robot_car_v3_refactored.ino`](firmware/robot_car_v3_refactored/robot_car_v3_refactored.ino).
+
+| Original V3 behavior | Refactored implementation | Engineering purpose |
+|---|---|---|
+| Multiple independent movement `if` statements | Prioritized `if / else if` selection | Avoid conflicting plans in one evaluation |
+| Blocking `delay()` during movement | `millis()`-based timed steps | Structure time-controlled motion without long `delay()` calls |
+| `pulseIn()` with no explicit timeout | 30 ms echo timeout | Bound ultrasonic waiting time |
+| No echo could produce 0 cm | `SONAR_FAULT`: stop and retry | Separate missing data from a close obstacle |
+| Unbounded post-obstacle search | 8-second timeout, latched fault | Limit indefinite movement |
+| Implicit sequencing | `FOLLOW_LINE`, `EXECUTE_STEPS`, `SEARCH_FOR_LINE` and fault modes | Make transitions inspectable |
+
+Key functions include `drive(Motion)`, `startTimedSteps()`, `updateTimedSteps()`, `measureDistanceCm()` and `chooseLineAction()`.
+
+These are **firmware changes**, not proof of improved physical tracking or avoidance performance.
 
 ## Build and validation
 
-1. Install the **Arduino IDE** and select the actual board and serial port.
-2. Open `firmware/robot_car_v3_refactored/robot_car_v3_refactored.ino`.
-3. Run **Verify / Compile** in the Arduino IDE.
-4. Verify the pin mapping against the actual hardware. Check motor-driver and sensor electrical compatibility.
-5. **Test with wheels raised off the ground first**; validate motor directions and PWM behavior.
-6. Check inner and outer IR polarity on both black/white surfaces.
-7. Check the ultrasonic echo with an object at a known distance.
-8. Only then evaluate line following, obstacle clearance, recovery, no-echo handling, and the search timeout in a controlled area.
+1. Install **Arduino IDE** and choose the actual board and serial port.
+2. Open [`robot_car_v3_refactored.ino`](firmware/robot_car_v3_refactored/robot_car_v3_refactored.ino).
+3. Run **Verify / Compile** for the selected board.
+4. Confirm wiring, motor-driver voltage requirements, and IR sensor signal polarity.
+5. Test motor direction with the wheels **raised off the ground**.
+6. Check sonar distance readings, no-echo behavior, line tracking, obstacle avoidance, and search timeout in a controlled environment.
 
-### Validation record
+See the [hardware validation checklist](docs/validation_checklist.md) for test steps.
 
-| Check | Current status |
+| Validation item | Status |
 |---|---|
-| Arduino-board compilation | Not verified on a selected physical Arduino board |
-| Actual pin wiring | Not verified |
-| Wheel forward/reverse polarity | Not verified |
-| IR black/white HIGH/LOW polarity | Not verified |
-| Sonar distance and missing-echo behavior | Not verified on hardware |
-| Search success, timeout and obstacle avoidance | Not verified on hardware |
+| Source-level refactor | Completed |
+| Arduino board-specific compilation | **Not yet confirmed** |
+| Pin wiring and motor direction | **Not yet confirmed** |
+| IR polarity and sonar behavior | **Not yet confirmed** |
+| End-to-end physical testing of refactored firmware | **Not yet completed** |
+| Quantified success rate / response latency | **Not measured** |
 
-This project does **not** report measured success rates, latency results, or end-to-end hardware validation for the refactored version.
+## Limitations and future work
 
-## Known limitations and engineering trade-offs
+- **Partial blocking remains:** ultrasonic `pulseIn()` can wait up to 30 ms; the controller is not fully non-blocking.
+- **No continuous sensing during maneuvers:** obstacle distance is not checked during active timed steps or line recovery.
+- **Conservative no-echo behavior:** an out-of-range object or weak reflection may stop the robot until a valid echo returns.
+- **Open-loop movements:** fixed motor timings do not compensate for battery variation, wheel slip, or changing surfaces.
+- **Sensor polarity not revalidated:** the firmware uses raw digital states; black/white mapping must be checked on hardware.
+- **Search timeout not tuned:** 8 seconds is a proposed safety bound, not a measured optimum.
 
-- The firmware still uses `pulseIn()` (up to 30 ms blocking per ultrasonic measurement). It is **not fully non-blocking**.
-- Ultrasonic reads are performed in follow/fault mode, **not during timed maneuvers or post-obstacle line search**. Obstacle events during those sequences are not detected by this firmware.
-- Stopping on missing sonar echoes is a conservative policy. It can also immobilize the robot when an object is outside sensor range or the surface does not return an echo.
-- The 8-second search limit is a **proposed safety setting**, not an experimentally tuned threshold. The actual robot may need a different value.
-- Motion durations are open-loop; motor load, battery voltage, friction and floor geometry can change the resulting displacement.
-- A `HIGH` signal is assumed to indicate a detected line when leaving search mode, based on the original V3 logic; actual sensor polarity requires verification.
-- The original sketch is not an RTOS, PID, SLAM, odometry or map-based navigation implementation.
+**Possible next steps:** bench compilation and physical validation, serial logging of state transitions, safer timeout recovery, and measured line-following/obstacle-avoidance tests.
 
 ## Repository structure
 
 ```text
-Arduino-Robot-Car-V3-Refactored/
+Arduino-Autonomous-Robot-Car/
 ├── firmware/
 │   └── robot_car_v3_refactored/
 │       └── robot_car_v3_refactored.ino
@@ -227,6 +216,9 @@ Arduino-Robot-Car-V3-Refactored/
 └── README.md
 ```
 
+*Demo video and hardware photos will be added after editing and verification.*
+
 ## Author
 
-Hoi Chun (Chris) Wat
+**Hoi Chun (Chris) Wat**  
+M.S. Electrical and Computer Engineering · University of Florida
