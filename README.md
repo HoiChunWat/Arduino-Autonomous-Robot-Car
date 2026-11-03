@@ -1,4 +1,4 @@
-# Arduino Autonomous Robot Car — V3 Refactored
+# Arduino Autonomous Robot Car 
 
 A hardware-oriented Arduino robot-car firmware project featuring four digital infrared sensors, ultrasonic obstacle sensing, and independent left/right PWM motor control. This branch of the project is a **safety-oriented refactor of the author's Version 3 sketch**: it keeps the documented wiring, motion commands, PWM calibration, and obstacle maneuver timings, while changing the control architecture and error handling.
 
